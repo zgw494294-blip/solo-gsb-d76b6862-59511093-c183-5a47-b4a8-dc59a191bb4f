@@ -5,7 +5,11 @@
 let state = null;
 let editingId = null; // 正在编辑的待发提示 id
 let editingIssueId = null; // 正在追加现场问题记录的提示 id（已发或待发）
-let busy = false;     // 有请求在途时禁用确认按钮，防止重复点击
+/* 在途请求计数：交错发出的请求（如工种回报与待发重排同时）各自结束时只
+ * 释放自身占用，计数归零才解禁——避免一个请求的收尾把另一个仍在途请求的
+ * 占用提前解开（回报尚未结束就被重排的收尾解禁，从而重复提交相同回报）。 */
+let busyCount = 0;
+let busy = false;     // 有请求在途（busyCount > 0）时禁用写入口，防止重复点击
 let prevStatus = null; // 上一帧状态，用于识别回到开场前的切换
 
 /* ---------------------------------------------------------------- 单控制席
@@ -82,9 +86,24 @@ function toast(msg) {
 
 /* ---------------------------------------------------------------- 请求 */
 
-async function api(path, body) {
+/* 请求开始：占用一份在途计数并禁用写入口。 */
+function busyEnter() {
+  busyCount += 1;
   busy = true;
   updateBusy();
+}
+
+/* 请求结束：只释放本次请求自身的占用——仍有其他交错请求在途时保持禁用，
+ * 全部结束（计数归零）后才按最新状态恢复；成功、409 刷新、HTTP 错误与
+ * 网络失败都走这里，既不会提前解禁也不会永久锁住。 */
+function busyLeave() {
+  busyCount = Math.max(0, busyCount - 1);
+  busy = busyCount > 0;
+  updateBusy();
+}
+
+async function api(path, body) {
+  busyEnter();
   try {
     const res = await fetch(path, {
       method: "POST",
@@ -113,8 +132,7 @@ async function api(path, body) {
     toast("网络错误：" + err.message);
     return null;
   } finally {
-    busy = false;
-    updateBusy();
+    busyLeave();
   }
 }
 
@@ -198,8 +216,7 @@ function renderControl() {
 
 /* 启用或接管控制席：凭当前版本号，成功返回的随机凭据只保存在本标签页。 */
 async function claimControl(enabling) {
-  busy = true;
-  updateBusy();
+  busyEnter();
   try {
     const res = await fetch(enabling ? "/api/control/enable" : "/api/control/takeover", {
       method: "POST",
@@ -228,8 +245,7 @@ async function claimControl(enabling) {
   } catch (err) {
     toast("网络错误：" + err.message);
   } finally {
-    busy = false;
-    updateBusy();
+    busyLeave();
   }
 }
 
@@ -707,10 +723,11 @@ function canVerifyReport() {
   return !!state && state.status === "live" && !!state.current && v.enabled && !busy;
 }
 
-/* 按最新状态同步已渲染回报按钮的 disabled：请求在途（busy）全部禁用防止
- * 重复回报；请求结束后必须调用本函数恢复——成功 / 409 刷新 / 请求失败都
- * 只依据当前最新状态重算，避免按钮在一次请求后永久卡死。按钮的显隐与
- * 文字仍由 renderVerify 重建，这里只衔接请求状态，不改回报资格判定本身。 */
+/* 按最新状态同步已渲染回报按钮的 disabled：任一请求在途（busy，含交错
+ * 发出的其他请求，如待发重排）全部禁用防止重复回报；所有请求结束后必须
+ * 调用本函数恢复——成功 / 409 刷新 / 请求失败都只依据当前最新状态重算，
+ * 避免按钮在一次请求后永久卡死。按钮的显隐与文字仍由 renderVerify 重建，
+ * 这里只衔接请求状态，不改回报资格判定本身。 */
 function updateVerifyButtons() {
   if (!state || state.status === "setup") return;
   const card = $("#verify-card");

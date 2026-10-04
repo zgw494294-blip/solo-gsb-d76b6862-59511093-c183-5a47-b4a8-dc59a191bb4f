@@ -139,6 +139,11 @@ python3 tests/verify.test.py
 # 与取消；409 刷新、网络失败、400 后按钮都不卡死（以真实渲染出的 disabled
 # 属性断言，不构造绕过资格检查的按钮）；暂停、无凭据页、被接管旧页可回报，
 # 完成收场与核验关闭不可回报。
+#
+# 另含「回报与重排交错」回归（T16–T17）：回报在途时点待发 ↑/↓ 重排，任一
+# 请求先结束（成功 / 409 / 400 / 网络失败）都只释放自身的在途占用——另一
+# 请求未结束前两工种按钮保持禁用、重复点击不发第二个回报；全部结束后按
+# 最新状态恢复，不提前解禁也不永久锁住。
 node tests/verify.test.js
 ```
 
@@ -152,6 +157,17 @@ node tests/verify.test.js
   - 未构造"始终可用"的按钮：`reportVerify()` 以同一资格判定兜底，禁用按钮的真实点击不会发请求；确认仍须本页有控制权、两工种就绪且未暂停。
 - **接口不变**：`POST /api/verify/report` 仍提交 `department`、`cue_id`、`round`、`ready` 与可选 `X-Control-Token`，响应语义（成功状态、`409` 附最新状态、`400`、永不 `403`）不变；当前席有效凭据仍随请求提交并在成功 / `409` 后保留，不会被误清。
 - **回归命令**：`node tests/verify.test.js`（新增 T12–T15，断言全部读取真实渲染出的按钮 `disabled`，并经"回退修复后 22 处断言失败"验证有效）；其余前端回归 `node tests/control-seat.test.js`、`node tests/archive-modal.test.js`；后端回归 `python3 tests/verify.test.py` 等（需 `pip install -r requirements.txt`）。
+
+### 本次修复：回报与待发重排交错时，回报未结束却被重排收尾提前解禁
+
+- **现象**：同页拥有控制权、核验开启且有当前提示时，点击灯光「报就绪」后再点待发 ↑/↓ 重排；重排先失败（如 409 或网络错误）时，灯光 / 音响两个回报按钮就恢复可点——此时回报请求其实还未结束，再点灯光会重复提交相同回报。
+- **原因（纯前端）**：在途标记 `busy` 是全部请求共用的单一布尔：回报与重排同时在途时，谁先结束谁的 `finally` 就把 `busy` 复位为 `false`，把另一个仍在途请求的占用提前解开，回报按钮与 `reportVerify()` 的入口守卫随之失效。
+- **修复（仅 `app/static/app.js` 请求与按钮衔接，未改接口语义）**：
+  - 在途标记改为**计数**（`busyCount` + `busyEnter()` / `busyLeave()`）：每个请求开始占一份、结束只释放自身一份；任一请求仍在途时 `busy` 保持为真——两工种回报按钮保持禁用、`reportVerify()` 提交入口继续拒绝回报；计数归零后才按**当时最新状态**恢复；
+  - 成功、`409` 刷新、HTTP 错误（如 400）、网络失败四种结束方式都走同一 `finally` 释放路径：不会提前解禁，也不会永久锁住；
+  - 回报资格判定（核验启用 + 演出中 + 有当前提示）、暂停可回报、确认就绪门槛、当前席有效凭据保留等行为均不变。
+- **接口不变**：`POST /api/verify/report` 仍提交 `department`、`cue_id`、`round`、`ready` 与可选 `X-Control-Token`，响应语义（成功状态、`409` 附最新状态、`400`、永不 `403`）不变。
+- **回归命令**：`node tests/verify.test.js`（新增 T16–T17：两请求可控响应覆盖"重排先结束 / 回报先结束"两种顺序，断言真实渲染按钮的 `disabled` 与回报请求数量，并经"回退修复后 11 处断言失败"验证有效）；其余前端回归 `node tests/control-seat.test.js`、`node tests/archive-modal.test.js`；后端回归 `python3 tests/verify.test.py` 等（需 `pip install -r requirements.txt`）。
 
 ## API 一览
 
