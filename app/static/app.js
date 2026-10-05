@@ -5,7 +5,25 @@
 let state = null;
 let editingId = null; // 正在编辑的待发提示 id
 let editingIssueId = null; // 正在追加现场问题记录的提示 id（已发或待发）
-let busy = false;     // 有请求在途时禁用确认按钮，防止重复点击
+/* 在途写请求计数：每个请求只释放自己的占用。
+ * 旧实现用单一布尔 busy：回报与重排等请求交错发出时，先结束的请求在 finally
+ * 里把 busy 置 false，另一请求仍在途却被提前解禁——两个回报按钮恢复可点，
+ * 再点会提交相同回报。改为计数器后，只有全部在途请求都结束才解禁；任一请求
+ * 未结束，回报入口（按钮 disabled 与 reportVerify 兜底）都继续拒绝。 */
+let inFlight = 0;
+function acquireBusy() {
+  inFlight++;
+  updateBusy();
+}
+function releaseBusy() {
+  inFlight = Math.max(0, inFlight - 1);
+  updateBusy();
+}
+/* 仍有任意写请求在途即为忙：成功、409 刷新、HTTP 错误、网络失败都只让各自
+ * 的请求结束并 releaseBusy，不能提前解禁，也不会因失败路径漏释放而永久锁住。 */
+function isBusy() {
+  return inFlight > 0;
+}
 let prevStatus = null; // 上一帧状态，用于识别回到开场前的切换
 
 /* ---------------------------------------------------------------- 单控制席
@@ -83,8 +101,7 @@ function toast(msg) {
 /* ---------------------------------------------------------------- 请求 */
 
 async function api(path, body) {
-  busy = true;
-  updateBusy();
+  acquireBusy();
   try {
     const res = await fetch(path, {
       method: "POST",
@@ -113,8 +130,9 @@ async function api(path, body) {
     toast("网络错误：" + err.message);
     return null;
   } finally {
-    busy = false;
-    updateBusy();
+    // 只释放本请求自己的在途占用：交错的其他请求仍在途时保持禁用，
+    // 全部结束后由 releaseBusy -> updateBusy 按最新状态恢复
+    releaseBusy();
   }
 }
 
@@ -142,29 +160,31 @@ function applyState(s) {
 
 function updateBusy() {
   const writable = canWrite(); // 非控制席禁用一切写操作（仍可接管）
+  const busyNow = isBusy(); // 仍有任意写请求在途：防重复提交；各请求只释放自身占用
   const btn = $("#confirm-btn");
   // 暂停期间、或启用核验而两工种未全部就绪时禁用确认按钮（服务端同样拒绝并返回 409）
-  if (btn) btn.disabled = busy || !writable || !state || !state.current || state.paused || verifyBlocked();
+  if (btn) btn.disabled = busyNow || !writable || !state || !state.current || state.paused || verifyBlocked();
   const archiveBtn = $("#archive-btn");
-  if (archiveBtn) archiveBtn.disabled = busy || !writable || archiveSubmitting || !state || state.status === "setup";
+  if (archiveBtn) archiveBtn.disabled = busyNow || !writable || archiveSubmitting || !state || state.status === "setup";
   const pauseBtn = $("#pause-btn");
-  if (pauseBtn) pauseBtn.disabled = busy || !writable || !state || state.status !== "live";
+  if (pauseBtn) pauseBtn.disabled = busyNow || !writable || !state || state.status !== "live";
   // 撤回末条：演出中（含暂停）或已完成、且存在已发记录时可用；开场前禁用
   const withdrawBtn = $("#withdraw-btn");
-  if (withdrawBtn) withdrawBtn.disabled = busy || !writable || !state || !state.issued.length;
+  if (withdrawBtn) withdrawBtn.disabled = busyNow || !writable || !state || !state.issued.length;
   const resetBtn = $("#reset-btn");
-  if (resetBtn) resetBtn.disabled = busy || !writable;
+  if (resetBtn) resetBtn.disabled = busyNow || !writable;
   const startBtn = $("#start-show");
-  if (startBtn) startBtn.disabled = busy || !writable;
+  if (startBtn) startBtn.disabled = busyNow || !writable;
   const controlBtn = $("#control-btn");
-  if (controlBtn) controlBtn.disabled = busy;
+  if (controlBtn) controlBtn.disabled = busyNow;
   // 开场前的核验启用按钮：受控制席保护；演出页的回报按钮无需凭据，
   // 不随控制资格禁用，由 updateVerifyButtons 按演出状态与在途请求管理
   const verifyEnableBtn = $("#verify-enable-btn");
-  if (verifyEnableBtn) verifyEnableBtn.disabled = busy || !writable;
+  if (verifyEnableBtn) verifyEnableBtn.disabled = busyNow || !writable;
   // 演出页的回报按钮：请求在途禁用（防重复回报），结束后按最新状态恢复；
   // 不随控制资格禁用（回报无需凭据）。开场 /api/setup 成功后 renderVerify
-  // 在 busy 仍为 true 时渲染，全靠这里把按钮恢复为可点。
+  // 在仍有在途请求时渲染，全靠这里把按钮恢复为可点。交错的多个请求各自结束
+  // 只释放自身占用，仍有请求未结束时两工种按钮保持禁用。
   updateVerifyButtons();
 }
 
@@ -198,8 +218,7 @@ function renderControl() {
 
 /* 启用或接管控制席：凭当前版本号，成功返回的随机凭据只保存在本标签页。 */
 async function claimControl(enabling) {
-  busy = true;
-  updateBusy();
+  acquireBusy();
   try {
     const res = await fetch(enabling ? "/api/control/enable" : "/api/control/takeover", {
       method: "POST",
@@ -228,8 +247,7 @@ async function claimControl(enabling) {
   } catch (err) {
     toast("网络错误：" + err.message);
   } finally {
-    busy = false;
-    updateBusy();
+    releaseBusy();
   }
 }
 
@@ -701,16 +719,18 @@ function verifyBlocked() {
 /* 演出页核验卡片是否允许回报：核验启用、演出中、存在当前提示即可。
  * 回报是工种操作，不看本页控制资格（只读/被接管旧页同样可回报）；暂停中
  * 也允许（仅确认发出被暂停挡下）；已完成（无当前提示）或核验关闭不可回报。
- * 在途请求另由 busy 挡下，防止同一工种重复回报。 */
+ * 在途请求另由 isBusy() 挡下：回报与重排等请求交错时，只要还有任一请求
+ * 未结束，提交入口即拒绝回报，防止同一/另一工种重复提交。 */
 function canVerifyReport() {
   const v = verifyState();
-  return !!state && state.status === "live" && !!state.current && v.enabled && !busy;
+  return !!state && state.status === "live" && !!state.current && v.enabled && !isBusy();
 }
 
-/* 按最新状态同步已渲染回报按钮的 disabled：请求在途（busy）全部禁用防止
- * 重复回报；请求结束后必须调用本函数恢复——成功 / 409 刷新 / 请求失败都
- * 只依据当前最新状态重算，避免按钮在一次请求后永久卡死。按钮的显隐与
- * 文字仍由 renderVerify 重建，这里只衔接请求状态，不改回报资格判定本身。 */
+/* 按最新状态同步已渲染回报按钮的 disabled：仍有任意请求在途时全部禁用，防止
+ * 交错请求（如回报未结束又发起重排）被先结束的请求提前解禁；每个请求结束只
+ * 释放自身占用——成功 / 409 刷新 / HTTP 错误 / 网络失败都只依据当前最新状态
+ * 重算，全部结束后统一恢复，既不提前解禁，也不在一次失败后永久卡死。按钮的
+ * 显隐与文字仍由 renderVerify 重建，这里只衔接请求状态，不改回报资格判定本身。 */
 function updateVerifyButtons() {
   if (!state || state.status === "setup") return;
   const card = $("#verify-card");
@@ -751,7 +771,7 @@ function renderVerify() {
     <div class="${v.all_ready ? "verify-ok" : "verify-wait"}">${v.all_ready
       ? "两工种均已就绪，可确认发出"
       : "待灯光、音响都报就绪后才能确认发出"}</div>`;
-  // innerHTML 已整体重建：立即按最新状态与在途标记同步一次真实 disabled
+  // innerHTML 已整体重建：立即按最新状态与在途计数同步一次真实 disabled
   // （渲染发生在请求在途时，属性为禁用；结束后由 updateBusy 再同步恢复）。
   updateVerifyButtons();
 }
@@ -765,7 +785,7 @@ function renderVerifySetup() {
   badge.textContent = v.enabled ? "本场核验：已启用 ✓" : "本场核验：未启用";
   badge.className = "verify-badge " + (v.enabled ? "on" : "off");
   btn.classList.toggle("hidden", v.enabled);
-  btn.disabled = busy || !canWrite();
+  btn.disabled = isBusy() || !canWrite();
 }
 
 /* 工种回报就绪/未就绪：提交工种、当前提示 cue_id、当前轮次与就绪布尔值。
@@ -1081,7 +1101,7 @@ $("#reset-btn").addEventListener("click", () => {
 /* 启用本场核验（仅开场前）：凭当前版本号，受控制席保护；成功后本场演出中
  * 灯光、音响须分别对当前提示报就绪，全部就绪才能确认发出。 */
 $("#verify-enable-btn").addEventListener("click", () => {
-  if (!state || busy || !canWrite()) return;
+  if (!state || isBusy() || !canWrite()) return;
   api("/api/verify/enable", { version: state.version });
 });
 
@@ -1113,7 +1133,7 @@ $("#withdraw-btn").addEventListener("click", () => {
 });
 
 $("#control-btn").addEventListener("click", () => {
-  if (!state || busy) return;
+  if (!state || isBusy()) return;
   if (!state.control_enabled) {
     claimControl(true); // 未启用：本页启用并成为控制席
     return;

@@ -14,6 +14,13 @@
  * 的成功与 409 响应回报 control_granted=false，失效缓存被清除、页面转只读）；
  * 已就绪再点报未就绪（取消）。
  *
+ * T16 覆盖「回报与待发重排交错」回归：同页有控制权、核验开启且有当前提示，
+ * 点灯光回报后再点待发上移，用两个可控响应分别覆盖两种结束顺序——重排先
+ * HTTP 错误 / 回报后成功，以及回报先 409 刷新 / 重排后网络失败：先结束者只
+ * 释放自身占用，另一请求未结束时两工种按钮保持真实 disabled 且提交入口拒绝
+ * 相同回报（真实禁用按钮与绕过禁用的入口调用都不新增请求）；全部结束后成功、
+ * 409 刷新、HTTP 错误、网络失败都按最新状态恢复，不提前解禁也不永久锁住。
+ *
  * 运行：node tests/verify.test.js
  */
 
@@ -428,6 +435,13 @@ function startShowWithTwoCues(ctx) {
   ctx.document.el("start-show").dispatch("click");
   if (ctx.pending.length === before) throw new Error("开场请求未发出（录入校验未通过）");
   return lastRequest(ctx);
+}
+
+/* 取待发列表里真实渲染出来的重排按钮（上移/下移），用于经真实元素派发点击。 */
+function reorderButton(ctx, action, idx) {
+  return ctx.document.querySelectorAll(
+    `#pending-list button[data-action="${action}"][data-idx="${idx}"]`
+  )[0] || null;
 }
 
 /* ------------------------------------------------------------ 断言 */
@@ -959,6 +973,133 @@ async function t15_reportGatingStates() {
   check(allReportButtons(off).length === 0, "核验关闭时不渲染回报按钮");
 }
 
+async function t16_interleavedReportReorderBothOrders() {
+  console.log("T16 回报与重排交错：先结束者只释放自身占用，两工种按钮保持禁用至全部结束（两种结束顺序）");
+
+  /* 场景 A：先点灯光回报、再点待发上移（重排）；重排先以 HTTP 错误结束，
+   * 回报后成功结束。重排失败不得提前解禁，成功后才按最新状态恢复；
+   * 保持期间再点灯光（真实禁用按钮 + 绕过禁用的提交入口）都被拒绝。 */
+  {
+    const ctx = loadApp({ cueControlToken: "seat-token" });
+    await respond(lastRequest(ctx), liveState({
+      control_enabled: true,
+      control_granted: true,
+      verify: verifyView(),
+    }));
+    const light = () => reportButton(ctx, "lighting");
+    const sound = () => reportButton(ctx, "sound");
+    check(!light().disabled && !sound().disabled, "A 初始：两工种回报按钮可点");
+    const base = ctx.pending.length; // 初始 GET /api/state 等已结束请求也留在 pending
+
+    // 1) 灯光回报发出
+    clickButton(ctx, light());
+    const reportReq = ctx.pending[ctx.pending.length - 1];
+    check(reportReq.path === "/api/verify/report", "A 点击灯光发出回报请求");
+    check(reportReq.options.headers["X-Control-Token"] === "seat-token", "A 回报仍携带可选凭据");
+    check(light().disabled && sound().disabled, "A 回报在途：两工种按钮禁用");
+
+    // 2) 回报尚未结束，点待发第二条「上移」发起重排（交错请求）
+    const upBtn = reorderButton(ctx, "up", 1);
+    check(!!upBtn && !upBtn.disabled, "A 待发上移按钮本身可点（交错发起）");
+    clickButton(ctx, upBtn);
+    const reorderReq = ctx.pending[ctx.pending.length - 1];
+    check(reorderReq.path === "/api/reorder", "A 交错发起重排请求");
+    const orderBody = JSON.parse(reorderReq.options.body);
+    check(orderBody.order.join(",") === "2,1", "A 重排载荷为交换后的待发顺序");
+    check(ctx.pending.length - base === 2, "A 交错后共 2 个在途请求");
+
+    // 3) 重排先结束（500 HTTP 错误）：只释放自身占用，回报仍在途
+    await respondError(reorderReq, 500, { error: "写入失败" });
+    check(light().disabled === true, "A 重排先失败：灯光按钮未被提前解禁");
+    check(sound().disabled === true, "A 重排先失败：音响按钮未被提前解禁");
+    // 真实禁用按钮点击：委托早退
+    const before = ctx.pending.length;
+    clickButton(ctx, light());
+    check(ctx.pending.length === before, "A 真实点击禁用的灯光按钮不产生请求");
+    // 绕过 disabled 的提交入口：canVerifyReport 仍因在途计数拒绝，不重复回报
+    clickAction(ctx, { action: "verify-report", dept: "lighting" });
+    check(ctx.pending.length === before, "A 提交入口在另一请求未结束时拒绝相同回报");
+
+    // 4) 回报成功结束：全部结束，按最新状态恢复（不永久锁住）
+    await respond(reportReq, liveState({
+      control_enabled: true,
+      control_granted: true,
+      verify: verifyView({ lighting: true }),
+    }));
+    check(light().disabled === false, "A 全部结束后灯光按钮恢复（取消就绪）");
+    check(sound().disabled === false, "A 全部结束后音响按钮恢复");
+    check(reportButton(ctx, "lighting").textContent.trim() === "取消就绪", "A 成功回报生效：文案切换");
+    check(ctx.storage.getItem("cueControlToken") === "seat-token", "A 有效凭据保留");
+    // 恢复后的提交被接受，且只新增一个请求
+    clickAction(ctx, { action: "verify-report", dept: "sound" });
+    check(ctx.pending.length === before + 1, "A 恢复后再点音响才发出第三个请求");
+    check(ctx.pending[ctx.pending.length - 1].path === "/api/verify/report", "A 第三个请求确为回报");
+    await respond(lastRequest(ctx), liveState({
+      control_enabled: true,
+      control_granted: true,
+      verify: verifyView({ lighting: true, sound: true, all_ready: true }),
+    }));
+  }
+
+  /* 场景 B：同样交错，但回报先以 409 结束（页面刷新到新轮次），重排后以网络
+   * 失败结束。409 刷新同样只释放自身占用；最后一个请求失败结束后按最新状态
+   * 恢复，既不提前解禁也不永久锁住。 */
+  {
+    const ctx = loadApp();
+    await respond(lastRequest(ctx), liveState({ verify: verifyView() }));
+    const light = () => reportButton(ctx, "lighting");
+    const sound = () => reportButton(ctx, "sound");
+
+    clickButton(ctx, light());
+    const reportReq = lastRequest(ctx);
+    check(reportReq.path === "/api/verify/report", "B 点击灯光发出回报请求");
+    clickButton(ctx, reorderButton(ctx, "up", 1));
+    const reorderReq = lastRequest(ctx);
+    check(reorderReq.path === "/api/reorder", "B 交错发起重排请求");
+    check(light().disabled && sound().disabled, "B 两请求在途：两工种按钮禁用");
+
+    // 回报先结束：409 + 最新状态（新轮次 3、当前提示换为 id 2）
+    await respond(reportReq, {
+      error: "conflict",
+      message: "操作已过期",
+      state: liveState({
+        version: 7,
+        current: { id: 2, number: "A2", content: "音乐起" },
+        next: null,
+        pending: [{ id: 2, number: "A2", content: "音乐起" }],
+        remaining: 1,
+        verify: verifyView({ round: 3, cue_id: 2 }),
+      }),
+    }, 409);
+    check(ctx.document.el("verify-card").innerHTML.includes("第 3 轮"), "B 回报 409 后刷新为最新轮次");
+    check(light().disabled === true, "B 409 刷新后重排仍在途：灯光按钮保持禁用");
+    check(sound().disabled === true, "B 409 刷新后重排仍在途：音响按钮保持禁用");
+    const before = ctx.pending.length;
+    clickAction(ctx, { action: "verify-report", dept: "lighting" });
+    check(ctx.pending.length === before, "B 重排未结束时提交入口仍拒绝回报");
+
+    // 重排最后以网络失败结束：全部结束，按最新状态恢复，不卡死
+    await rejectRequest(reorderReq);
+    check(light().disabled === false, "B 全部结束（末个为网络失败）后灯光按钮恢复");
+    check(sound().disabled === false, "B 全部结束后音响按钮恢复");
+    // 恢复后的回报使用 409 刷新得到的最新轮次与提示，且只新增一个请求
+    clickAction(ctx, { action: "verify-report", dept: "sound" });
+    check(ctx.pending.length === before + 1, "B 恢复后再点音响仅发出一个新请求");
+    const body = JSON.parse(lastRequest(ctx).options.body);
+    check(body.round === 3 && body.cue_id === 2 && body.department === "sound" && body.ready === true,
+      "B 恢复后回报基于 409 刷新的最新轮次与提示");
+    await respond(lastRequest(ctx), liveState({
+      version: 7,
+      current: { id: 2, number: "A2", content: "音乐起" },
+      next: null,
+      pending: [{ id: 2, number: "A2", content: "音乐起" }],
+      remaining: 1,
+      verify: verifyView({ round: 3, cue_id: 2, sound: true }),
+    }));
+    check(!light().disabled && !sound().disabled, "B 成功结束后按钮仍可继续操作");
+  }
+}
+
 /* ------------------------------------------------------------ 主流程 */
 
 (async function main() {
@@ -978,6 +1119,7 @@ async function t15_reportGatingStates() {
     t13_inFlightBlocksAndSuccessReenables,
     t14_conflictFailureAnd400Reenable,
     t15_reportGatingStates,
+    t16_interleavedReportReorderBothOrders,
   ];
   for (const run of cases) await run();
 
